@@ -1,0 +1,11 @@
+/*
+!.gitignore
+!metrics.py
+!train.py
+!utils.py
+!train_EDL.py
+!train_MCD.py
+!models/
+!preprocess/
+__pycache__/
+*.pyc
