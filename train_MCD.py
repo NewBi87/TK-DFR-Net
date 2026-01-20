@@ -5,8 +5,8 @@ import time
 import torch
 import numpy as np
 
-#from models.model import Model
-from models.ablation_model import Model
+from models.model import Model
+# from models.ablation_model import Model
 from utils import load_adj, EHRDataset, format_time, MultiStepLRScheduler, BinaryEDLLoss
 from metrics import evaluate_codes, evaluate_hf
 from preprocess import load_timeseries_data
@@ -22,8 +22,8 @@ if __name__ == '__main__':
     dataset = 'mimic3'  # 'mimic3' or 'mimic4'
     task = 'm'  # 'm' or 'h'
     use_cuda = True
-    #device = torch.device('cuda' if torch.cuda.is_available() and use_cuda else 'cpu')
-    device = torch.device('cuda:1' if torch.cuda.is_available() and use_cuda else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() and use_cuda else 'cpu')
+    # device = torch.device('cuda:1' if torch.cuda.is_available() and use_cuda else 'cpu')
 
     code_size = 48
     graph_size = 48
@@ -45,9 +45,14 @@ if __name__ == '__main__':
     patient_path = os.path.join('data', dataset,'patient_timeseries')
 
     # load_adj现在会自动融合本体图
+    # code_adj = load_adj(dataset_path, device=device, use_ontology=True, alpha=0.05)
+    # code_num = len(code_adj)
+    # print("code num is: ",code_num)
+
     code_adj = load_adj(dataset_path, device=device, use_ontology=True, alpha=0.05)
-    code_num = len(code_adj)
-    print("code num is: ",code_num)
+    # 获取 code_num (取 tuple 第一个元素的长度)
+    code_num = len(code_adj[0])
+    print("code num is: ", code_num)
 
     print('loading train data ...')
     train_data = EHRDataset(train_path, label=task, batch_size=batch_size, shuffle=True, device=device)
@@ -103,11 +108,18 @@ if __name__ == '__main__':
     if not os.path.exists(param_path):
         os.makedirs(param_path)
 
+    # model = Model(code_num=code_num, code_size=code_size,
+    #               adj=code_adj, graph_size=graph_size, hidden_size=hidden_size, t_attention_size=t_attention_size,
+    #               t_output_size=t_output_size,
+    #               output_size=output_size, dropout_rate=dropout_rate,activation=activation,
+    #               feature_input_dim= feature_input_dim,device=device).to(device)
+
     model = Model(code_num=code_num, code_size=code_size,
-                  adj=code_adj, graph_size=graph_size, hidden_size=hidden_size, t_attention_size=t_attention_size,
+                  adj=code_adj,  # 这里传入 tuple
+                  graph_size=graph_size, hidden_size=hidden_size, t_attention_size=t_attention_size,
                   t_output_size=t_output_size,
-                  output_size=output_size, dropout_rate=dropout_rate,activation=activation,
-                  feature_input_dim= feature_input_dim,device=device).to(device)
+                  output_size=output_size, dropout_rate=dropout_rate, activation=activation,
+                  feature_input_dim=feature_input_dim, device=device).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     scheduler = MultiStepLRScheduler(optimizer, epochs, task_conf[task]['lr']['init_lr'],
                                      task_conf[task]['lr']['milestones'], task_conf[task]['lr']['lrs'])

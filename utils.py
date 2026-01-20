@@ -8,141 +8,53 @@ import re
 from preprocess import load_sparse
 #多个辅助函数和类，它们在数据加载、学习率调度以及时间格式化等方面提供了重要的支持。
 # 加载邻接矩阵adj,
-# 原加载类
-# def load_adj(path, device=torch.device('cpu')):
-#     filename = os.path.join(path, 'code_adj.npz')
-#     adj = torch.from_numpy(load_sparse(filename)).to(device=device, dtype=torch.float32)
-#     return adj
+# 文件: utils.py
 
-# def load_adj(path, device = torch.device('cpu'), use_ontology=True, alpha=0.3):
-#     """
-#     修改后的图加载函数：融合统计图与本体图
-#     """
-#     # 加载原始统计图
-#     filename = os.path.join(path, 'code_adj.npz')
-#
-#     # 调用原有的读取函数，返回的是numpy array
-#     adj_stat_np = load_sparse(filename)
-#
-#     # 转为Tensor
-#     adj_stat = torch.from_numpy(adj_stat_np).to(device=device, dtype=torch.float32)
-#
-#     # 2.加载并融合医学本体图
-#     if use_ontology:
-#         filename_ont = os.path.join(path, 'adj_ontology.npz')
-#         if os.path.exists(filename_ont):
-#             print(f"[info] Loading and fusing ontology graph from {filename_ont}...")
-#
-#             data_ont = np.load(filename_ont)
-#             row = data_ont['row']
-#             col = data_ont['col']
-#             val = data_ont['data']
-#             shape = data_ont['shape']
-#
-#             adj_ont_np = np.zeros(shape, dtype=np.float32)
-#             adj_ont_np[row, col] = val
-#
-#             adj_ont = torch.from_numpy(adj_ont_np).to(device=device, dtype=torch.float32)
-#
-#             adj_stat = adj_stat + torch.eye(adj_stat.shape[0]).to(device)
-#             adj_stat[adj_stat > 1] = 1
-#
-#             # 加权融合
-#             adj = (1 - alpha) * adj_stat + alpha * adj_ont
-#
-#             ## 归一化
-#             # 针对有向图/非对称矩阵，我们使用 D^-1 * A (行归一化)
-#             # 这样每一行的和为1，代表从该节点流出的总概率/权重
-#             rowsum = adj.sum(1)
-#             r_inv = torch.pow(rowsum, -1).flatten()
-#             r_inv[torch.isinf(r_inv)] = 0.
-#             d_mat_inv = torch.diag(r_inv)
-#
-#             adj = torch.mm(d_mat_inv, adj)
-#             return adj
-#         else:
-#             print("[Warning] Ontology graph not found, using original graph only.")
-#     # 3. Fallback: 原始逻辑
-#     adj_stat = adj_stat + torch.eye(adj_stat.shape[0]).to(device)
-#     adj_stat[adj_stat > 1] = 1
-#
-#     # 对原始图也采用相同的行归一化，保持一致性
-#     rowsum = adj_stat.sum(1)
-#     r_inv = torch.pow(rowsum, -1).flatten()
-#     r_inv[torch.isinf(r_inv)] = 0.
-#     d_mat_inv = torch.diag(r_inv)
-#     adj_stat = torch.mm(d_mat_inv, adj_stat)
-#
-#     return adj_stat
-
-def load_adj(path, device=torch.device('cpu'), use_ontology=True, alpha=0.2):
+def load_adj(path, device=torch.device('cpu'), use_ontology=True, alpha=0.05):
     """
-    修改后的图加载函数：融合统计图与本体图
-    【融合策略】：叠加增强模式 (Add-on)，保留原图完整信息
+    [修正后] 双图模式：返回 (adj_stat, adj_ont) 两个独立的图，交给模型去融合
     """
-    # -------------------------------------------------------
-    # 1. 加载原始统计图 (Base Graph)
-    # -------------------------------------------------------
+    # 1. 加载统计图 (Base Graph)
     filename_stat = os.path.join(path, 'code_adj.npz')
     adj_stat_np = load_sparse(filename_stat)
     adj_stat = torch.from_numpy(adj_stat_np).to(device=device, dtype=torch.float32)
 
-    # 预处理：给统计图加上自循环 (Self-loop)
-    # 无论是否融合，原图都应该有自循环
+    # 归一化统计图 (Base Normalization)
     adj_stat = adj_stat + torch.eye(adj_stat.shape[0]).to(device)
     adj_stat[adj_stat > 1] = 1
-
-    # -------------------------------------------------------
-    # 2. 加载并融合医学本体图 (如果开启)
-    # -------------------------------------------------------
-    if use_ontology:
-        filename_ont = os.path.join(path, 'adj_ontology.npz')
-        if os.path.exists(filename_ont):
-            print(f"[Info] Loading and fusing ontology graph from {filename_ont}...")
-
-            # 读取本体图
-            data_ont = np.load(filename_ont)
-            row = data_ont['row']
-            col = data_ont['col']
-            val = data_ont['data']
-            shape = data_ont['shape']
-
-            adj_ont_np = np.zeros(shape, dtype=np.float32)
-            adj_ont_np[row, col] = val
-            adj_ont = torch.from_numpy(adj_ont_np).to(device=device, dtype=torch.float32)
-
-            # --- 【核心修改】叠加增强模式 ---
-            # 旧逻辑 (Trade-off): adj = (1 - alpha) * adj_stat + alpha * adj_ont
-            # 缺点：alpha=0.3时，原图权重只剩0.7，信息丢失严重
-
-            # 新逻辑 (Add-on): adj = adj_stat + alpha * adj_ont
-            # 优点：原图保持权重1.0，本体图作为额外 shortcut (权重0.05) 补充进来
-            adj = adj_stat + alpha * adj_ont
-
-            # --- 归一化 (Row-Normalize) ---
-            # 针对有向图/非对称矩阵，使用 D^-1 * A
-            rowsum = adj.sum(1)
-            r_inv = torch.pow(rowsum, -1).flatten()
-            r_inv[torch.isinf(r_inv)] = 0.
-            d_mat_inv = torch.diag(r_inv)
-
-            adj = torch.mm(d_mat_inv, adj)
-
-            return adj
-        else:
-            print("[Warning] Ontology graph not found, using original graph only.")
-
-    # -------------------------------------------------------
-    # 3. Fallback: 仅使用统计图 (未开启融合 或 文件不存在)
-    # -------------------------------------------------------
-    # 归一化
     rowsum = adj_stat.sum(1)
     r_inv = torch.pow(rowsum, -1).flatten()
     r_inv[torch.isinf(r_inv)] = 0.
     d_mat_inv = torch.diag(r_inv)
     adj_stat = torch.mm(d_mat_inv, adj_stat)
 
-    return adj_stat
+    # 2. 加载本体图 (Ontology Graph)
+    # 默认兜底：如果没有本体图，第二个图也用统计图
+    adj_ont = adj_stat
+
+    if use_ontology:
+        filename_ont = os.path.join(path, 'adj_ontology.npz')
+        if os.path.exists(filename_ont):
+            print(f"[Info] Loading ontology graph for Dual-Graph Fusion: {filename_ont}")
+            data_ont = np.load(filename_ont)
+            # 重建矩阵
+            adj_ont_np = np.zeros(data_ont['shape'], dtype=np.float32)
+            adj_ont_np[data_ont['row'], data_ont['col']] = data_ont['data']
+            adj_ont = torch.from_numpy(adj_ont_np).to(device=device, dtype=torch.float32)
+
+            # 归一化本体图 (Ontology Normalization)
+            adj_ont = adj_ont + torch.eye(adj_ont.shape[0]).to(device)
+            adj_ont[adj_ont > 1] = 1
+            rowsum_ont = adj_ont.sum(1)
+            r_inv_ont = torch.pow(rowsum_ont, -1).flatten()
+            r_inv_ont[torch.isinf(r_inv_ont)] = 0.
+            d_mat_inv_ont = torch.diag(r_inv_ont)
+            adj_ont = torch.mm(d_mat_inv_ont, adj_ont)
+        else:
+            print("[Warning] Ontology graph not found, Dual-Graph layer will use duplicate stat graphs.")
+
+    # [关键] 返回元组 (Tuple)，而不是相加后的单个矩阵
+    return adj_stat, adj_ont
 # 自定义数据类，负责加载和预处理 EHR 数据，并提供迭代器接口以供训练和评估使用。
 '''
 添加功能：索引：保持 train_pids 和 train_code_x 之间的索引关系

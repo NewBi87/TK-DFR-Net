@@ -9,3 +9,6 @@
 !preprocess/
 __pycache__/
 *.pyc
+
+*_back.py
+*.bak
