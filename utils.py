@@ -272,112 +272,123 @@ def format_time(seconds):
 import torch.nn.functional as F
 
 
+# class BinaryEDLLoss(torch.nn.Module):
+#     def __init__(self, annealing_step=10, kl_weight=1e-4, device=torch.device('cpu')):
+#         """
+#         Args:
+#             annealing_step: 退火步数
+#             kl_weight: KL 散度的最大权重系数。[关键修改] 建议设为 1e-4 或 1e-5
+#             device: 设备
+#         """
+#         super().__init__()
+#         self.annealing_step = annealing_step
+#         self.kl_weight = kl_weight  # [新增] 保存权重参数
+#         self.device = device
+#         self.epoch = 0
+#
+#     def update_epoch(self, epoch):
+#         self.epoch = epoch
+#
+#     def forward(self, logits, target):
+#         """
+#         [高性能版] 使用 Digamma Loss + Logits Clamp + 自适应 KL 权重
+#         """
+#         # [修改] 限制 logits 范围，防止 evidence 过大导致 digamma 计算溢出
+#         # 范围 [-10, 10] 足以覆盖 sigmoid 0.000045 到 0.999955 的区间，非常安全
+#         logits = torch.clamp(logits, min=-10, max=10)
+#
+#         # 1. 获取证据 (Evidence)
+#         evidence_pos = torch.nn.functional.softplus(logits)
+#         evidence_neg = torch.nn.functional.softplus(-logits)
+#
+#         alpha = evidence_pos + 1
+#         beta = evidence_neg + 1
+#         S = alpha + beta
+#
+#         # 2. Digamma Loss (主任务损失)
+#         # 数学原理：最小化 E[log(p)]，即最大化似然
+#         digamma_S = torch.digamma(S)
+#         digamma_alpha = torch.digamma(alpha)
+#         digamma_beta = torch.digamma(beta)
+#
+#         # 当 target=1 时，优化 alpha 部分；当 target=0 时，优化 beta 部分
+#         risk = target * (digamma_S - digamma_alpha) + (1 - target) * (digamma_S - digamma_beta)
+#
+#         # 3. KL 散度正则化 (防止模型过度自信)
+#         # 计算当前 epoch 的退火系数 (0.0 -> 1.0)
+#         annealing_coef = min(1.0, self.epoch / self.annealing_step)
+#
+#         # 计算 Beta 分布的 KL 散度 (Uniform Prior Beta(1,1))
+#         # 近似计算公式
+#         kl_alpha = (alpha - 1) * (1 - target)
+#         kl_beta = (beta - 1) * target
+#
+#         # [核心修改] 使用 self.kl_weight
+#         # 原来的 0.001 在 4000 个标签累加下依然太大，导致模型不敢预测。
+#         # 这里改用传入的参数 (默认 1e-4)，相当于给 KL 惩罚再除以 10 倍。
+#         kl_penalty = annealing_coef * self.kl_weight * (kl_alpha + kl_beta)
+#
+#         # 4. 总损失
+#         # mean 会对 batch_size * num_labels 取平均
+#         loss = torch.mean(risk + kl_penalty)
+#         return loss
+
 class BinaryEDLLoss(torch.nn.Module):
-    def __init__(self, annealing_step=10, device=torch.device('cpu')):
+    def __init__(self, annealing_step=10, kl_weight=1e-4, device=torch.device('cpu')):
         super().__init__()
         self.annealing_step = annealing_step
+        self.kl_weight = kl_weight
         self.device = device
         self.epoch = 0
 
     def update_epoch(self, epoch):
-        """
-        需要在每个 epoch 开始时调用此函数更新 epoch 数
-        用于计算 KL 散度的退火系数 (annealing coefficient)
-        """
         self.epoch = epoch
 
-    # def forward(self, logits, target):
-    #     """
-    #     logits: 模型直接输出 (batch_size, num_labels)，注意：不要经过 Sigmoid！
-    #     target: 真实标签 (batch_size, num_labels)，0 或 1
-    #     """
-    #     # 1. 将 Logits 分解为正负证据 (Evidence)
-    #     # softplus 保证证据是非负的
-    #     evidence_pos = F.softplus(logits)
-    #     evidence_neg = F.softplus(-logits)
-    #
-    #     # 2. 构建 Beta 分布参数 (alpha, beta)
-    #     # alpha = 正证据 + 1
-    #     # beta  = 负证据 + 1
-    #     alpha = evidence_pos + 1
-    #     beta = evidence_neg + 1
-    #
-    #     # S = 总证据强度 (Total Evidence)
-    #     S = alpha + beta
-    #
-    #     # 3. 预测概率 (Expectation of Beta distribution)
-    #     prob = alpha / S
-    #
-    #     # --- 计算损失项 ---
-    #
-    #     # A. 均方误差风险 (MSE Risk)
-    #     # 目标是 1 时，希望 prob 接近 1；目标是 0 时，希望 prob 接近 0
-    #     risk = (target - prob) ** 2
-    #
-    #     # B. 不确定性方差 (Variance Risk)
-    #     # 当总证据 S 越大，方差越小，模型越确定
-    #     variance = (prob * (1 - prob)) / (S + 1)
-    #
-    #     # C. KL 散度正则化 (KL Divergence Regularization)
-    #     # 防止模型在“不知道”的时候强行给出一个错误的高置信度
-    #     # 我们希望当没有证据时，分布接近均匀分布 (alpha=1, beta=1)
-    #
-    #     # 计算退火系数：随着训练进行，KL 正则化的权重逐渐增加
-    #     # 防止训练初期模型因为正则化太强而学不到东西
-    #     annealing_coef = min(1.0, self.epoch / self.annealing_step)
-    #
-    #     # 近似计算：仅对“误导性证据”进行惩罚
-    #     # 如果标签是1，我们惩罚 negative evidence；如果标签是0，我们惩罚 positive evidence
-    #     misleading_evidence = target * evidence_neg + (1 - target) * evidence_pos
-    #     kl_penalty = 0.01 * misleading_evidence
-    #
-    #     # 总损失 = 风险 + 方差 + 退火系数 * KL惩罚
-    #     loss = torch.mean(risk + variance + annealing_coef * kl_penalty)
-    #
-    #     return loss
     def forward(self, logits, target):
         """
-        logits: 模型直接输出 (batch_size, num_labels)
-        target: 真实标签 (batch_size, num_labels)
+        [回归版] 使用 MSE Loss (Sum of Squares)
+        相比 Digamma，MSE 在多标签任务中更容易优化 Top-K 排名，提升 F1。
         """
         # 1. 获取证据 (Evidence)
-        evidence_pos = F.softplus(logits)
-        evidence_neg = F.softplus(-logits)
+        # 使用 ReLU 替代 Softplus，梯度更直接，稀疏性更好
+        evidence = torch.relu(logits)
 
-        # 2. 构建 Beta 分布参数
-        alpha = evidence_pos + 1
-        beta = evidence_neg + 1
-        S = alpha + beta
+        alpha = evidence + 1
+        S = alpha + 1  # 二分类下 beta=1, 所以 S = alpha + 1
+
+        # 2. 预测概率 (Belief)
         prob = alpha / S
 
-        # --- 计算损失项 ---
+        # 3. MSE Loss (A. Classification Risk)
+        # 目标是 target，预测是 prob
+        loss_mse = torch.mean((target - prob) ** 2 + prob * (1 - prob) / (S + 1))
 
-        # A. 均方误差风险 (MSE Risk) - 【核心修改点】
-        # MIMIC 数据极度不平衡，MSE 容易导致模型预测全 0。
-        # 我们给正样本 (target=1) 增加权重，强迫模型关注少数类。
-        # 经验值：10 到 20 倍是比较合适的
-        pos_weight = 20.0
-
-        # 如果是正样本，Loss 放大 20 倍；负样本保持 1 倍
-        weight = target * pos_weight + (1 - target) * 1.0
-
-        # 加权后的 MSE
-        risk = weight * ((target - prob) ** 2)
-
-        # B. 不确定性方差 (Variance Risk)
-        variance = (prob * (1 - prob)) / (S + 1)
-
-        # C. KL 散度正则化
+        # 4. KL 散度正则化 (B. Regularization)
+        # 计算当前 epoch 的退火系数
         annealing_coef = min(1.0, self.epoch / self.annealing_step)
-        misleading_evidence = target * evidence_neg + (1 - target) * evidence_pos
 
-        # 保持 1e-4 的缩放，这已经是安全的了
-        scaling_factor = 1e-4
-        kl_penalty = scaling_factor * misleading_evidence
+        # Beta(alpha, 1) 与 Beta(1, 1) 的 KL 散度
+        # 公式简化后：
+        # 当 target=1 时，希望 alpha 大，KL = log(alpha) - (alpha-1)/alpha ... (近似)
+        # 这里使用通用的 Beta KL 公式
 
-        # 总损失
-        loss = torch.mean(risk + variance + annealing_coef * kl_penalty)
+        # 为了简化计算并防止 NaN，我们使用针对 Beta(alpha, 1) 的简化形式：
+        # KL[Beta(alpha, 1) || Beta(1, 1)] = log(alpha) + 1/alpha - 1  <-- 这是一个近似趋势
+        # 但在 Binary EDL 中，官方代码通常这样写：
 
+        # 当 target=1 (原本是正例)，我们不希望它被惩罚(因为我们希望alpha大)，所以 KL 只惩罚 target=0 的情况
+        # 当 target=0，我们希望 alpha=1 (即 evidence=0)
+
+        alpha_tilde = target + (1 - target) * alpha
+        beta_tilde = target * 1 + (1 - target) * 1  # beta 固定为 1
+
+        # 实际代码中，为了简单，往往只对误判的证据进行惩罚
+        # 既然 target=0，那么 evidence 应该为 0。所以惩罚 evidence 本身即可
+
+        kl_penalty = self.kl_weight * annealing_coef * evidence * (1 - target)
+
+        # 5. 总损失
+        loss = loss_mse + torch.mean(kl_penalty)
         return loss
 
 # --- 预备代码：Plan B 对比学习 Loss ---

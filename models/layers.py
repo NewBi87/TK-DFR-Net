@@ -16,17 +16,17 @@ class EmbeddingLayer(nn.Module):
         return self.c_embeddings, self.n_embeddings, self.u_embeddings
 
 
+# [恢复目标] models/layers.py -> GraphLayer
+# 这是 "Residual Adaptive Fusion" (F1 0.2383 版本)
+
 class GraphLayer(nn.Module):
     def __init__(self, adj, code_size, graph_size):
         super().__init__()
-        # adj 参数保留以兼容旧接口，但实际上主要由 forward 传入的动态图决定
         self.adj = adj
+        self.dense_stat = nn.Linear(code_size, graph_size)
+        self.dense_ont = nn.Linear(code_size, graph_size)
 
-        # 定义两个独立的图卷积变换层
-        self.dense_stat = nn.Linear(code_size, graph_size)  # 对应统计图
-        self.dense_ont = nn.Linear(code_size, graph_size)  # 对应本体图
-
-        # 自适应融合门控
+        # 恢复门控机制
         self.fusion_gate = nn.Sequential(
             nn.Linear(graph_size * 2, 1),
             nn.Sigmoid()
@@ -34,34 +34,30 @@ class GraphLayer(nn.Module):
         self.activation = nn.LeakyReLU()
 
     def forward(self, code_x, neighbor, c_embeddings, n_embeddings, adj_stat=None, adj_ont=None):
-        """
-        参数兼容：
-        adj_stat, adj_ont: 可以在 forward 时动态传入。如果不传，默认使用 self.adj (不推荐)
-        """
-        # 如果未传入，使用默认 (兼容性处理)
         if adj_stat is None: adj_stat = self.adj
         if adj_ont is None: adj_ont = self.adj
 
         center_codes = torch.unsqueeze(code_x, dim=-1)
         neighbor_codes = torch.unsqueeze(neighbor, dim=-1)
 
-        # 1. 统计图分支 (Data-Driven)
+        # 1. 统计图分支
         center_embed_stat = center_codes * c_embeddings
         agg_stat = torch.matmul(adj_stat, center_embed_stat)
         h_stat = self.activation(self.dense_stat(center_embed_stat + agg_stat))
 
-        # 2. 知识图分支 (Knowledge-Driven)
+        # 2. 本体图分支
         center_embed_ont = center_codes * c_embeddings
         agg_ont = torch.matmul(adj_ont, center_embed_ont)
         h_ont = self.activation(self.dense_ont(center_embed_ont + agg_ont))
 
-        # 3. 自适应融合
+        # 3. [恢复] 残差门控融合 (Residual Adaptive Fusion)
+        # H = H_stat + alpha * H_ont
         combined = torch.cat([h_stat, h_ont], dim=-1)
         alpha = self.fusion_gate(combined)
-        h_fused = alpha * h_stat + (1 - alpha) * h_ont  # 得到 co_embeddings
 
-        # 4. 邻居处理 (Neighbor Embeddings)
-        # 邻居特征通常依赖统计共现，继续使用统计图
+        h_fused = h_stat + alpha * h_ont
+
+        # 4. 邻居处理
         neighbor_embed = neighbor_codes * n_embeddings
         agg_neighbor = torch.matmul(adj_stat, neighbor_embed)
         no_embeddings = self.activation(self.dense_stat(neighbor_embed + agg_neighbor))

@@ -64,13 +64,18 @@ if __name__ == '__main__':
 
     task_conf = {
         'm': {
-            'dropout': 0.45,     # 0.45
+            'dropout': 0.5,
             'output_size': code_num,
             'evaluate_fn': evaluate_codes,
             'lr': {
                 'init_lr': 0.01,
-                'milestones': [20, 30],
-                'lrs': [1e-3, 1e-5]
+                # [核心修改] 将里程碑推迟到 Warmup (50) 之后
+                # 策略：
+                # 0-60 epoch: LR = 0.01 (BCE预热 + EDL适应期)
+                # 60-120 epoch: LR = 1e-3 (EDL精调)
+                # 120+ epoch: LR = 1e-4 (收敛)
+                'milestones': [60, 120],
+                'lrs': [1e-3, 1e-4]
             }
         },
         'h': {
@@ -105,7 +110,8 @@ if __name__ == '__main__':
     bce_loss = torch.nn.BCELoss()
     # EDL 用于微调 (Fine-tune)
     # 此时模型已经收敛，可以给一点 step 让它适应，但不需要太慢
-    edl_loss = BinaryEDLLoss(annealing_step=20, device=device)
+    # edl_loss = BinaryEDLLoss(annealing_step=50, device=device)
+    edl_loss = BinaryEDLLoss(annealing_step=100, kl_weight=1e-4, device=device)
 
     valid_bce_loss = torch.nn.BCEWithLogitsLoss()
 
@@ -151,21 +157,25 @@ if __name__ == '__main__':
     for epoch in range(epochs):
         print('Epoch %d / %d:' % (epoch + 1, epochs))
 
-        # --- 核心策略：分阶段 ---
-        if epoch < 30:
+        # [修改点 2] 延长预热时间：从 30 增加到 50 (甚至 100)
+        # 建议: 如果总 epoch=200, 预热 50 是比较稳妥的
+        WARMUP_EPOCHS = 50
+
+        if epoch < WARMUP_EPOCHS:
             if epoch == 0: print(">>> [Phase 1] Warm-up with BCE Loss...")
             current_loss_fn = bce_loss
             use_edl = False
-            # 验证时使用 BCEWithLogitsLoss，确保 Loss 数值可读
             current_valid_loss_fn = valid_bce_loss
         else:
-            if epoch == 30: print(">>> [Phase 2] Switching to EDL Loss...")
+            if epoch == WARMUP_EPOCHS: print(">>> [Phase 2] Switching to EDL Loss...")
             current_loss_fn = edl_loss
             use_edl = True
-            current_loss_fn.update_epoch(epoch - 30)
-            # 验证时使用 EDL Loss
+
+            # [修改点 3] 关键！这里必须减去新的预热长度
+            # 否则 annealing 计算会出错 (直接从很大的系数开始)
+            current_loss_fn.update_epoch(epoch - WARMUP_EPOCHS)
+
             current_valid_loss_fn = edl_loss
-        # ---------------------
 
         model.train()
         total_loss = 0.0
@@ -190,6 +200,11 @@ if __name__ == '__main__':
                 loss = current_loss_fn(probs, y)
 
             loss.backward()
+
+            # [修改 4] 增加梯度裁剪 (Gradient Clipping)
+            # 防止 EDL Loss 在初期产生巨大的梯度震荡
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             total_loss += loss.item() * output_size * len(code_x)
             total_num += len(code_x)
