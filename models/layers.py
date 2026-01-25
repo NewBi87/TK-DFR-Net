@@ -16,6 +16,8 @@ class EmbeddingLayer(nn.Module):
         return self.c_embeddings, self.n_embeddings, self.u_embeddings
 
 
+# models/layers.py -> GraphLayer (Gated Version)
+
 class GraphLayer(nn.Module):
     def __init__(self, adj, code_size, graph_size):
         super().__init__()
@@ -24,44 +26,55 @@ class GraphLayer(nn.Module):
         self.dense_ont = nn.Linear(code_size, graph_size)
         self.activation = nn.LeakyReLU()
 
-        # [修改] 用于计算 Correction 的线性层
+        # [修改 1] 定义融合层 (计算 Correction)
         self.fusion_linear = nn.Linear(graph_size * 2, graph_size)
 
-        # [必须补上] ★★★ 零初始化 ★★★
-        # 强制初始修正量为0，保证开局性能 = 单图模型 (F1 0.238)
+        # [新增] 定义门控层 (计算 Gate)
+        # 输入是拼接特征，输出是 0~1 的门控系数
+        self.gate_linear = nn.Linear(graph_size * 2, graph_size)
+
+        # [关键] ★★★ 零初始化 (双重保险) ★★★
+        # 1. 修正量 Correction 初始化为 0 (保证开局不崩)
         nn.init.zeros_(self.fusion_linear.weight)
         nn.init.zeros_(self.fusion_linear.bias)
+
+        # 2. 门控 Gate 初始化
+        # 我们可以让门控初始偏置为负 (如 -2.0)，这样初始 sigmoid(gate) 接近 0
+        # 这意味着模型开局几乎就是纯单图模型，随着训练逐渐打开门控
+        nn.init.xavier_uniform_(self.gate_linear.weight)
+        nn.init.constant_(self.gate_linear.bias, -2.0)
 
     def forward(self, code_x, neighbor, c_embeddings, n_embeddings, adj_stat=None, adj_ont=None):
         if adj_stat is None: adj_stat = self.adj
         if adj_ont is None: adj_ont = self.adj
 
+        # ... (特征提取部分不变) ...
         center_codes = torch.unsqueeze(code_x, dim=-1)
         neighbor_codes = torch.unsqueeze(neighbor, dim=-1)
 
-        # 1. 统计图分支 (Stat)
         center_embed_stat = center_codes * c_embeddings
         agg_stat = torch.matmul(adj_stat, center_embed_stat)
         h_stat = self.activation(self.dense_stat(center_embed_stat + agg_stat))
 
-        # 2. 本体图分支 (Ont)
         center_embed_ont = center_codes * c_embeddings
         agg_ont = torch.matmul(adj_ont, center_embed_ont)
         h_ont = self.activation(self.dense_ont(center_embed_ont + agg_ont))
 
-        # 3. [核心升级] 残差拼接融合 (Residual Concatenation)
-        # 逻辑：H_final = H_stat + MLP([H_stat, H_ont])
-
-        # A. 交互：拼接两个图的信息
+        # [核心升级] 门控残差拼接 (Gated Residual Concatenation)
         combined = torch.cat([h_stat, h_ont], dim=-1)
 
-        # B. 修正：计算修正向量 (Correction Vector)
+        # 1. 计算修正量 (Correction)
         correction = self.activation(self.fusion_linear(combined))
 
-        # C. 融合：基准 + 修正
-        h_fused = h_stat + correction
+        # 2. 计算门控 (Gate) - 范围 (0, 1)
+        gate = torch.sigmoid(self.gate_linear(combined))
 
-        # 4. 邻居处理
+        # 3. 门控残差连接
+        # H = H_stat + Gate * Correction
+        # 简单样本 Gate -> 0, 复杂样本 Gate -> 1
+        h_fused = h_stat + gate * correction
+
+        # ... (邻居处理不变) ...
         neighbor_embed = neighbor_codes * n_embeddings
         agg_neighbor = torch.matmul(adj_stat, neighbor_embed)
         no_embeddings = self.activation(self.dense_stat(neighbor_embed + agg_neighbor))
