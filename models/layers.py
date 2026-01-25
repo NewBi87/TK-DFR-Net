@@ -16,22 +16,21 @@ class EmbeddingLayer(nn.Module):
         return self.c_embeddings, self.n_embeddings, self.u_embeddings
 
 
-# [恢复目标] models/layers.py -> GraphLayer
-# 这是 "Residual Adaptive Fusion" (F1 0.2383 版本)
-
 class GraphLayer(nn.Module):
     def __init__(self, adj, code_size, graph_size):
         super().__init__()
         self.adj = adj
         self.dense_stat = nn.Linear(code_size, graph_size)
         self.dense_ont = nn.Linear(code_size, graph_size)
-
-        # 恢复门控机制
-        self.fusion_gate = nn.Sequential(
-            nn.Linear(graph_size * 2, 1),
-            nn.Sigmoid()
-        )
         self.activation = nn.LeakyReLU()
+
+        # [修改] 用于计算 Correction 的线性层
+        self.fusion_linear = nn.Linear(graph_size * 2, graph_size)
+
+        # [必须补上] ★★★ 零初始化 ★★★
+        # 强制初始修正量为0，保证开局性能 = 单图模型 (F1 0.238)
+        nn.init.zeros_(self.fusion_linear.weight)
+        nn.init.zeros_(self.fusion_linear.bias)
 
     def forward(self, code_x, neighbor, c_embeddings, n_embeddings, adj_stat=None, adj_ont=None):
         if adj_stat is None: adj_stat = self.adj
@@ -40,22 +39,27 @@ class GraphLayer(nn.Module):
         center_codes = torch.unsqueeze(code_x, dim=-1)
         neighbor_codes = torch.unsqueeze(neighbor, dim=-1)
 
-        # 1. 统计图分支
+        # 1. 统计图分支 (Stat)
         center_embed_stat = center_codes * c_embeddings
         agg_stat = torch.matmul(adj_stat, center_embed_stat)
         h_stat = self.activation(self.dense_stat(center_embed_stat + agg_stat))
 
-        # 2. 本体图分支
+        # 2. 本体图分支 (Ont)
         center_embed_ont = center_codes * c_embeddings
         agg_ont = torch.matmul(adj_ont, center_embed_ont)
         h_ont = self.activation(self.dense_ont(center_embed_ont + agg_ont))
 
-        # 3. [恢复] 残差门控融合 (Residual Adaptive Fusion)
-        # H = H_stat + alpha * H_ont
-        combined = torch.cat([h_stat, h_ont], dim=-1)
-        alpha = self.fusion_gate(combined)
+        # 3. [核心升级] 残差拼接融合 (Residual Concatenation)
+        # 逻辑：H_final = H_stat + MLP([H_stat, H_ont])
 
-        h_fused = h_stat + alpha * h_ont
+        # A. 交互：拼接两个图的信息
+        combined = torch.cat([h_stat, h_ont], dim=-1)
+
+        # B. 修正：计算修正向量 (Correction Vector)
+        correction = self.activation(self.fusion_linear(combined))
+
+        # C. 融合：基准 + 修正
+        h_fused = h_stat + correction
 
         # 4. 邻居处理
         neighbor_embed = neighbor_codes * n_embeddings
