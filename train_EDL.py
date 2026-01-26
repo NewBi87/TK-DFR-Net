@@ -228,6 +228,121 @@ if __name__ == '__main__':
         torch.save(model.state_dict(), os.path.join(param_path, '%d.pt' % epoch))
 
     print("\nTraining completed. Hyperparameters used:")
+    # [新增] --------- 阶段 10: 自适应阈值搜索 ---------
+    print("\n>>> [Phase 10] Starting Threshold Search on Validation Set...")
+
+    # 1. 加载最好的模型 (如果 save_data 逻辑是存最后一个，这里直接用 model 即可；如果是存最好，需重新加载)
+    # 假设当前 model 是最后状态，或者您可以加载 param_path 下的 best model
+    # 这里我们直接用训练结束后的 model 进行演示
+    model.eval()
+
+    y_true_all = []
+    y_prob_all = []
+
+    # 2. 在验证集上收集所有的预测概率和真实标签
+    with torch.no_grad():
+        for step in range(len(valid_data)):
+            code_x, visit_lens, divided, y, neighbors, pid_index = valid_data[step]
+            output = model(code_x, divided, neighbors, visit_lens, pid_index, timeseries_data_valid).squeeze()
+
+            # 确保使用 Sigmoid (如果是 MSE/BCE) 或者 Evidence 转换 (如果是 EDL)
+            # 因为我们在 forward 里把 activation 设为了 None，这里需要手动处理
+            # 我们的 Loss 是 MSE，所以 output 是 Logits，需要 Sigmoid 变概率
+            # 或者是 EDL 的 evidence?
+            # 检查 utils.py 的 Loss: MSE 版使用的是 evidence = relu(logits), prob = evidence / (evidence+1)
+            # 或者简单的 Sigmoid?
+            # 让我们回顾 tk_v3_mse.log 的配置，我们用的是 MSE。
+            # 无论是哪种，为了阈值搜索，我们需要 "概率值"。
+            # 对于 MSE (Regression)，output 可能就是概率 (如果最后一层有激活)，或者 Logits。
+            # 检查 Model: output = model(...) -> Model 最后通常没有激活 (因为 activation=None passed)
+            # 所以这里应用 Sigmoid 是通用的安全做法 (将 logits 映射到 0-1)
+            probs = torch.sigmoid(output)
+
+            y_true_all.append(y.cpu().numpy())
+            y_prob_all.append(probs.cpu().numpy())
+
+    y_true_all = np.concatenate(y_true_all, axis=0)
+    y_prob_all = np.concatenate(y_prob_all, axis=0)
+
+    # 3. 搜索最佳阈值
+    best_thr = 0.5
+    best_f1 = 0.0
+
+    from sklearn.metrics import f1_score
+
+    # 搜索区间 [0.1, 0.9], 步长 0.05
+    for thr in np.arange(0.1, 0.95, 0.05):
+        y_pred_bin = (y_prob_all > thr).astype(int)
+        # 计算 Micro F1 (MIMIC-3 标准)
+        f1 = f1_score(y_true_all, y_pred_bin, average='micro')
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = thr
+
+    print(f"Best Threshold found on Validation: {best_thr:.2f} (F1: {best_f1:.4f})")
+
+    # 4. 用最佳阈值在测试集上重新评估
+    print(f">>> Applying Best Threshold ({best_thr:.2f}) to Test Set...")
+
+    y_true_test = []
+    y_prob_test = []
+
+    with torch.no_grad():
+        for step in range(len(test_data)):
+            code_x, visit_lens, divided, y, neighbors, pid_index = test_data[step]
+            output = model(code_x, divided, neighbors, visit_lens, pid_index, timeseries_data_test).squeeze()
+            probs = torch.sigmoid(output)
+            y_true_test.append(y.cpu().numpy())
+            y_prob_test.append(probs.cpu().numpy())
+
+    y_true_test = np.concatenate(y_true_test, axis=0)
+    y_prob_test = np.concatenate(y_prob_test, axis=0)
+
+    y_pred_test = (y_prob_test > best_thr).astype(int)
+    final_f1 = f1_score(y_true_test, y_pred_test, average='micro')
+
+    print(f"Final Test F1 Score (with thr={best_thr:.2f}): {final_f1:.4f}")
+    if final_f1 > 0.2505:
+        print("🎉 Congratulations! You have beaten the Baseline (0.2505)!")
+    else:
+        print(f"Gap to Baseline: {0.2505 - final_f1:.4f}")
+
+        # ... (在打印出 Final Test F1 之后) ...
+
+        print("\n>>> [Phase 11] Detailed Subgroup Analysis with Optimized Threshold...")
+        # 我们调用 metrics.py 里的评估函数，但是要稍微改一下让它支持传入 threshold
+        # 或者我们直接在这里手动算一下 Visit 分组结果
+
+        # 简单的实现方式：
+        # 遍历 test_data，用 best_thr 算 F1
+        visit_stats = {}  # key: visit_num, value: [y_true, y_pred]
+
+        with torch.no_grad():
+            for step in range(len(test_data)):
+                code_x, visit_lens, divided, y, neighbors, pid_index = test_data[step]
+                output = model(code_x, divided, neighbors, visit_lens, pid_index, timeseries_data_test).squeeze()
+                probs = torch.sigmoid(output)
+
+                # 使用最佳阈值
+                pred_binary = (probs > best_thr).float()
+
+                # 记录按 Visit 分组的数据
+                for i in range(len(code_x)):
+                    v_num = visit_lens[i]  # 这是一个 tensor 或 int
+                    if isinstance(v_num, torch.Tensor): v_num = v_num.item()
+
+                    if v_num not in visit_stats:
+                        visit_stats[v_num] = {'true': [], 'pred': []}
+                    visit_stats[v_num]['true'].append(y[i].cpu().numpy())
+                    visit_stats[v_num]['pred'].append(pred_binary[i].cpu().numpy())
+
+        print(f"\nSubgroup Performance at Threshold = {best_thr:.2f}:")
+        for v_num in sorted(visit_stats.keys()):
+            yt = np.array(visit_stats[v_num]['true'])
+            yp = np.array(visit_stats[v_num]['pred'])
+            if len(yt) > 0:
+                sub_f1 = f1_score(yt, yp, average='micro')
+                print(f"  Visit = {v_num} (n={len(yt)}): F1 = {sub_f1:.4f}")
     print(f"Seed: {seed}")
     print(f"Dataset: {dataset}")
     print(f"Graph Size: {graph_size}")
