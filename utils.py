@@ -265,6 +265,12 @@ def format_time(seconds):
         time_str = '%dh%dm%.1fs' % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
     return time_str
 
+def historical_hot(code_x, code_num, lens):
+    result = np.zeros((len(code_x), code_num), dtype=int)
+    for i, (x, l) in enumerate(zip(code_x, lens)):
+        result[i] = x[l - 1]
+    return result
+
 
 # ============================================================
 # Innovation Point B: Evidential Deep Learning (EDL) Loss
@@ -333,62 +339,72 @@ import torch.nn.functional as F
 #         loss = torch.mean(risk + kl_penalty)
 #         return loss
 
-class BinaryEDLLoss(torch.nn.Module):
-    def __init__(self, annealing_step=10, kl_weight=1e-4, device=torch.device('cpu')):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class BinaryEDLLoss(nn.Module):
+    def __init__(self, annealing_step=10, kl_weight=1e-4, aux_weight=1.0, device=torch.device('cpu')):
+        """
+        aux_weight: 辅助损失的权重。对于 Focal Loss，建议设大一点 (如 0.5 ~ 1.0)，因为它数值通常比 BCE 小。
+        """
         super().__init__()
         self.annealing_step = annealing_step
         self.kl_weight = kl_weight
+        self.aux_weight = aux_weight
         self.device = device
         self.epoch = 0
 
     def update_epoch(self, epoch):
         self.epoch = epoch
 
+    def focal_loss(self, logits, target, gamma=2.0, alpha=0.25):
+        """
+        二分类 Focal Loss 实现
+        gamma: 聚焦参数，越大越关注难分样本 (Default: 2.0)
+        alpha: 正负样本平衡参数 (Default: 0.25)
+        """
+        probs = torch.sigmoid(logits)
+
+        # 计算 focal term
+        # pt: 模型对正确类别的预测概率
+        pt = torch.where(target == 1, probs, 1 - probs)
+
+        # alpha_t: 平衡因子
+        alpha_t = torch.where(target == 1, alpha, 1 - alpha)
+
+        # Loss = - alpha_t * (1 - pt)^gamma * log(pt)
+        loss = - alpha_t * (1 - pt) ** gamma * torch.log(pt + 1e-8)
+
+        return torch.mean(loss)
+
     def forward(self, logits, target):
         """
-        [回归版] 使用 MSE Loss (Sum of Squares)
-        相比 Digamma，MSE 在多标签任务中更容易优化 Top-K 排名，提升 F1。
+        [混合版 V2] MSE (EDL) + Focal Loss (Ranking)
         """
-        # 1. 获取证据 (Evidence)
-        # 使用 ReLU 替代 Softplus，梯度更直接，稀疏性更好
+        # --- A. EDL 部分 (MSE) ---
         evidence = torch.relu(logits)
-
         alpha = evidence + 1
-        S = alpha + 1  # 二分类下 beta=1, 所以 S = alpha + 1
-
-        # 2. 预测概率 (Belief)
+        S = alpha + 1
         prob = alpha / S
 
-        # 3. MSE Loss (A. Classification Risk)
-        # 目标是 target，预测是 prob
+        # MSE Loss
         loss_mse = torch.mean((target - prob) ** 2 + prob * (1 - prob) / (S + 1))
 
-        # 4. KL 散度正则化 (B. Regularization)
-        # 计算当前 epoch 的退火系数
+        # KL 散度
         annealing_coef = min(1.0, self.epoch / self.annealing_step)
-
-        # Beta(alpha, 1) 与 Beta(1, 1) 的 KL 散度
-        # 公式简化后：
-        # 当 target=1 时，希望 alpha 大，KL = log(alpha) - (alpha-1)/alpha ... (近似)
-        # 这里使用通用的 Beta KL 公式
-
-        # 为了简化计算并防止 NaN，我们使用针对 Beta(alpha, 1) 的简化形式：
-        # KL[Beta(alpha, 1) || Beta(1, 1)] = log(alpha) + 1/alpha - 1  <-- 这是一个近似趋势
-        # 但在 Binary EDL 中，官方代码通常这样写：
-
-        # 当 target=1 (原本是正例)，我们不希望它被惩罚(因为我们希望alpha大)，所以 KL 只惩罚 target=0 的情况
-        # 当 target=0，我们希望 alpha=1 (即 evidence=0)
-
-        alpha_tilde = target + (1 - target) * alpha
-        beta_tilde = target * 1 + (1 - target) * 1  # beta 固定为 1
-
-        # 实际代码中，为了简单，往往只对误判的证据进行惩罚
-        # 既然 target=0，那么 evidence 应该为 0。所以惩罚 evidence 本身即可
-
         kl_penalty = self.kl_weight * annealing_coef * evidence * (1 - target)
 
-        # 5. 总损失
-        loss = loss_mse + torch.mean(kl_penalty)
+        loss_edl = loss_mse + torch.mean(kl_penalty)
+
+        # --- B. Ranking 部分 (Focal Loss) ---
+        # 专门针对 "硬负样本" 进行惩罚，优化 Top-K 排序
+        loss_focal = self.focal_loss(logits, target)
+
+        # --- C. 总损失 ---
+        loss = loss_edl + self.aux_weight * loss_focal
+
         return loss
 
 # --- 预备代码：Plan B 对比学习 Loss ---
@@ -422,3 +438,16 @@ class SupervisedContrastiveLoss(torch.nn.Module):
         # 4. 最终 Loss (加权平均)
         mean_log_prob_pos = (label_sim * log_prob).sum(1) / (label_sim.sum(1) + 1e-8)
         return -mean_log_prob_pos.mean()
+
+
+def historical_hot(code_x, code_num, lens):
+    result = np.zeros((len(code_x), code_num), dtype=int)
+    for i, (x, l) in enumerate(zip(code_x, lens)):
+        # [修复] 增加 .cpu() 检查，防止输入是 CUDA 张量时报错
+        if isinstance(x, torch.Tensor):
+            token = x[l - 1].cpu().item()  # 取出具体的病历代码 ID
+        else:
+            token = x[l - 1]  # 如果已经是 list 或 numpy
+
+        result[i] = token
+    return result
