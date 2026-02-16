@@ -18,17 +18,6 @@ from preprocess import load_timeseries_data
 #     return result
 
 
-def historical_hot(code_x, code_num, lens):
-    result = np.zeros((len(code_x), code_num), dtype=int)
-    for i, (x, l) in enumerate(zip(code_x, lens)):
-        # [修复] 增加 .cpu() 检查，防止输入是 CUDA 张量时报错
-        if isinstance(x, torch.Tensor):
-            token = x[l - 1].cpu().item()  # 取出具体的病历代码 ID
-        else:
-            token = x[l - 1]  # 如果已经是 list 或 numpy
-
-        result[i] = token
-    return result
 
 if __name__ == '__main__':
     seed = 6669     # 1337 42 56
