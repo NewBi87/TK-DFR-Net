@@ -53,6 +53,7 @@ class Model(nn.Module):
         embeddings = self.embedding_layer()
         c_embeddings, n_embeddings, u_embeddings = embeddings
         output = []
+        #-----新添加-----
 
         for code_x_i, divided_i, neighbor_i, len_i, pid_index_i in zip(code_x, divided, neighbors, lens, pid_index):
             no_embeddings_i_prev = None

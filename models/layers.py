@@ -44,6 +44,7 @@ class GraphLayer(nn.Module):
         nn.init.xavier_uniform_(self.gate_linear.weight)
         nn.init.constant_(self.gate_linear.bias, -2.0)
 
+    # 原融合：确诊疾病残差融合，邻居疾病直接输出
     def forward(self, code_x, neighbor, c_embeddings, n_embeddings, adj_stat=None, adj_ont=None):
         if adj_stat is None: adj_stat = self.adj
         if adj_ont is None: adj_ont = self.adj
@@ -80,6 +81,51 @@ class GraphLayer(nn.Module):
         no_embeddings = self.activation(self.dense_stat(neighbor_embed + agg_neighbor))
 
         return h_fused, no_embeddings
+
+    # def forward(self, code_x, neighbor, c_embeddings, n_embeddings, adj_stat=None, adj_ont=None):
+    #     if adj_stat is None: adj_stat = self.adj
+    #     if adj_ont is None: adj_ont = self.adj
+    #
+    #     # ==========================================
+    #     # 1. 中心确诊疾病 (Target Codes) 的双图融合
+    #     # ==========================================
+    #     center_codes = torch.unsqueeze(code_x, dim=-1)
+    #     center_embed_stat = center_codes * c_embeddings
+    #     agg_stat = torch.matmul(adj_stat, center_embed_stat)
+    #     h_stat = self.activation(self.dense_stat(center_embed_stat + agg_stat))
+    #
+    #     center_embed_ont = center_codes * c_embeddings
+    #     agg_ont = torch.matmul(adj_ont, center_embed_ont)
+    #     h_ont = self.activation(self.dense_ont(center_embed_ont + agg_ont))
+    #
+    #     combined_c = torch.cat([h_stat, h_ont], dim=-1)
+    #     correction_c = self.activation(self.fusion_linear(combined_c))
+    #     gate_c = torch.sigmoid(self.gate_linear(combined_c))
+    #     h_fused = h_stat + gate_c * correction_c
+    #
+    #     # ==========================================
+    #     # 2. 邻居历史疾病 (Neighbor Codes) 的对称双图融合 [本次修改核心]
+    #     # ==========================================
+    #     neighbor_codes = torch.unsqueeze(neighbor, dim=-1)
+    #     neighbor_embed = neighbor_codes * n_embeddings
+    #
+    #     # (a) 统计图聚合
+    #     agg_neighbor_stat = torch.matmul(adj_stat, neighbor_embed)
+    #     no_stat = self.activation(self.dense_stat(neighbor_embed + agg_neighbor_stat))
+    #
+    #     # (b) 本体图聚合
+    #     agg_neighbor_ont = torch.matmul(adj_ont, neighbor_embed)
+    #     no_ont = self.activation(self.dense_ont(neighbor_embed + agg_neighbor_ont))
+    #
+    #     # (c) 复用门控机制进行融合 (Weight Sharing)
+    #     combined_n = torch.cat([no_stat, no_ont], dim=-1)
+    #     correction_n = self.activation(self.fusion_linear(combined_n))
+    #     gate_n = torch.sigmoid(self.gate_linear(combined_n))
+    #
+    #     # (d) 门控残差输出
+    #     no_fused = no_stat + gate_n * correction_n
+    #
+    #     return h_fused, no_fused
 
 
 # class PatientFeatureLayer(nn.Module):

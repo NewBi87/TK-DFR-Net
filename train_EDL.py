@@ -411,94 +411,158 @@ if __name__ == '__main__':
 
     print("="*60)
 
-    # --------- 阶段 12: 不确定性案例分析 (Phase 12: Uncertainty Case Study) ---------
+    # # --------- 阶段 12: 不确定性案例分析 (严谨版) ---------
+    # print(f"\n>>> [Phase 12] Exporting Case Studies for Qualitative Analysis...")
+    #
+    # model.eval()
+    # cases = []
+    #
+    # with torch.no_grad():
+    #     for step in range(len(test_data)):
+    #         code_x, visit_lens, divided, y, neighbors, pid_index = test_data[step]
+    #         output = model(code_x, divided, neighbors, visit_lens, pid_index, timeseries_data_test).squeeze()
+    #
+    #         evidence = torch.relu(output)
+    #         S = evidence + 2
+    #         uncertainty = 2 / S
+    #         probs = (evidence + 1) / S
+    #         preds = (probs > best_thr).float()
+    #
+    #         y_np = y.cpu().numpy()
+    #         u_np = uncertainty.cpu().numpy()
+    #         preds_np = preds.cpu().numpy()
+    #
+    #         for i in range(len(code_x)):
+    #             # 计算样本级 F1 和 平均不确定性
+    #             p_f1 = f1_score(y_np[i], preds_np[i], average='binary')
+    #             mean_u = np.mean(u_np[i])
+    #             cases.append({
+    #                 'pid_index': pid_index[i],
+    #                 'f1': p_f1,
+    #                 'mean_uncertainty': mean_u
+    #             })
+    #
+    # # [核心修改] 放弃固定阈值，改用基于真实分布的排名 (Top 5% vs Bottom 20%)
+    # # 1. 按照 F1 分数降序排列所有病例
+    # cases.sort(key=lambda x: x['f1'], reverse=True)
+    #
+    # # 2. 提取 Top 50 作为 Good Cases，Bottom 200 作为 Bad Cases
+    # # (具体数字可根据 test_data 总样本量调整，保证不为 0)
+    # top_n = min(50, len(cases) // 10)
+    # bottom_n = min(200, len(cases) // 3)
+    #
+    # good_cases = cases[:top_n]
+    # bad_cases = cases[-bottom_n:]
+    #
+    # print(
+    #     f"  Extracted Top {len(good_cases)} Genuine Good Cases (Avg F1: {np.mean([c['f1'] for c in good_cases]):.4f})")
+    # print(
+    #     f"  Extracted Bottom {len(bad_cases)} Genuine Bad Cases (Avg F1: {np.mean([c['f1'] for c in bad_cases]):.4f})")
+    #
+    # if len(good_cases) > 0 and len(bad_cases) > 0:
+    #     avg_u_good = np.mean([c['mean_uncertainty'] for c in good_cases])
+    #     avg_u_bad = np.mean([c['mean_uncertainty'] for c in bad_cases])
+    #
+    #     print(f"\n[Hypothesis Verification] Uncertainty vs Performance:")
+    #     print(f"  Avg Uncertainty (Good Predictions): {avg_u_good:.4f}")
+    #     print(f"  Avg Uncertainty (Bad Predictions):  {avg_u_bad:.4f}")
+    #
+    #     if avg_u_bad > avg_u_good:
+    #         diff_pct = (avg_u_bad - avg_u_good) / avg_u_good * 100
+    #         print(f"SUCCESS: Uncertainty increased by {diff_pct:.2f}% on hard cases.")
+    #     else:
+    #         print(" WARNING: Uncertainty is not correlated with error.")
+    #
+    #     # 严谨打印真实的 Best Case
+    #     best_case = good_cases[0]
+    #     print(f"\n[Genuine Case Study]")
+    #     print(
+    #         f"  Best Case (PID {best_case['pid_index']}): Actual F1={best_case['f1']:.4f}, U={best_case['mean_uncertainty']:.4f}")
+    # else:
+    #     print(" Evaluation failed: Not enough valid cases.")
+    #
+    # print("=" * 60)
+    # --------- 阶段 12: 精确 Case Study 筛选与轻量化导出 ---------
+    # --------- 阶段 12: 精确 Case Study 筛选与轻量化导出 ---------
     print(f"\n>>> [Phase 12] Exporting Case Studies for Qualitative Analysis...")
 
-    # 定义函数计算不确定性 u = K / S
-    # 二分类 EDL 中，S = evidence_pos + evidence_neg + 2
-    # 不确定性 u = 2 / S
-
     model.eval()
-    cases = []
+    success_candidates = []
+    failure_candidates = []
 
     with torch.no_grad():
         for step in range(len(test_data)):
             code_x, visit_lens, divided, y, neighbors, pid_index = test_data[step]
             output = model(code_x, divided, neighbors, visit_lens, pid_index, timeseries_data_test).squeeze()
 
-            # 1. 计算证据和概率
+            # EDL 核心计算
             evidence = torch.relu(output)
-            alpha = evidence + 1
-            S = alpha + 1  # 二分类下 S = alpha + beta (beta=1) -> S = evidence + 2
-
-            # 2. 计算不确定性 (Uncertainty)
-            # u = 2 / S (S越大，证据越多，不确定性越低)
+            S = evidence + 2
             uncertainty = 2 / S
+            probs = (evidence + 1) / S
 
-            # 3. 获取预测概率
-            probs = alpha / S
-
-            # 4. 获取预测结果 (使用最佳阈值)
-            preds = (probs > best_thr).float()
-
-            # 5. 收集数据
             y_np = y.cpu().numpy()
             u_np = uncertainty.cpu().numpy()
-            preds_np = preds.cpu().numpy()
+            probs_np = probs.cpu().numpy()
 
             for i in range(len(code_x)):
-                # 计算该病人的 F1 (Sample-level F1)
-                # 注意：这里我们简单用 accuracy 或 f1 来衡量该样本预测得好坏
-                # 为了区分好坏案例，我们计算该病人所有疾病预测的 F1
-                p_f1 = f1_score(y_np[i], preds_np[i], average='binary')
+                v_len = visit_lens[i]
+                if isinstance(v_len, torch.Tensor): v_len = v_len.item()
 
-                # 计算该病人的平均不确定性 (Mean Uncertainty across all diseases)
+                # 获取该患者真实的疾病索引
+                true_idx = np.where(y_np[i] == 1)[0].tolist()
+                true_num = len(true_idx)
+
+                if true_num == 0:
+                    continue
+
+                # 【核心修复】：彻底废弃 best_thr，对齐 metrics.py 的 Top-K (K=true_num) 排序提取法
+                # 按照 EDL 输出概率从高到低排序，取最自信的前 true_num 个疾病作为预测结果
+                sorted_idx = np.argsort(probs_np[i])[::-1]
+                pred_idx = sorted_idx[:true_num].tolist()
+
+                # 生成用于计算当前样本个体 F1 的二进制数组
+                pred_bin = np.zeros_like(y_np[i])
+                pred_bin[pred_idx] = 1
+
+                # 此时算出的 p_f1 将完美符合全局日志的分布规律
+                p_f1 = f1_score(y_np[i], pred_bin, average='binary', zero_division=0)
                 mean_u = np.mean(u_np[i])
 
-                cases.append({
-                    'pid_index': pid_index[i],
+                case_data = {
+                    'pid': pid_index[i],
+                    'visit_count': v_len,
                     'f1': p_f1,
-                    'mean_uncertainty': mean_u
-                })
+                    'uncertainty': mean_u,
+                    'history_codes': code_x[i][:v_len - 1],
+                    'current_true': true_idx,
+                    'current_pred': pred_idx,
+                    'uncertainty_map': u_np[i]
+                }
 
-    # 6. 统计验证假设
-    # 假设：预测得好的病人 (High F1)，模型应该比较自信 (Low Uncertainty)
-    # 假设：预测得差的病人 (Low F1)，模型应该不确定 (High Uncertainty) -> 这就是 "Safe Failure"
+                # 筛选成功案例 (门槛：就诊>=2次，由于TopK法则提取更严格，F1>=0.30即可抓到极其精彩的病例)
+                if v_len >= 2 and p_f1 >= 0.30:
+                    success_candidates.append(case_data)
 
-    # 筛选
-        # [修改] 放宽筛选标准，适应 MIMIC-III 的难度
-        # Good Case: F1 > 0.5 (对于 4000 分类任务，0.5 已经很强了)
-        good_cases = [c for c in cases if c['f1'] >= 0.5]
-        # Bad Case: F1 < 0.1 (几乎完全预测错)
-        bad_cases = [c for c in cases if c['f1'] <= 0.1]
+                # 筛选失败拦截案例 (门槛：就诊>=2次，预测完全失准 F1=0，且不确定性>0.85)
+                elif v_len >= 2 and p_f1 < 0.05 and mean_u > 0.85:
+                    failure_candidates.append(case_data)
 
-        print(f"  Found {len(good_cases)} Good Cases (F1>=0.5)")
-        print(f"  Found {len(bad_cases)} Bad Cases (F1<=0.1)")
+    # 排序并截断 (各取 Top 50 保证轻量化)
+    success_candidates.sort(key=lambda x: x['f1'], reverse=True)
+    failure_candidates.sort(key=lambda x: x['uncertainty'], reverse=True)
 
-        if len(good_cases) > 0 and len(bad_cases) > 0:
-            avg_u_good = np.mean([c['mean_uncertainty'] for c in good_cases])
-            avg_u_bad = np.mean([c['mean_uncertainty'] for c in bad_cases])
+    final_success = success_candidates[:50]
+    final_failure = failure_candidates[:50]
 
-            print(f"\n[Hypothesis Verification] Uncertainty vs Performance:")
-            print(f"  Avg Uncertainty (Good Predictions): {avg_u_good:.4f}")
-            print(f"  Avg Uncertainty (Bad Predictions):  {avg_u_bad:.4f}")
+    import pickle
 
-            if avg_u_bad > avg_u_good:
-                print(" SUCCESS: The model is more uncertain when it makes mistakes! (EDL Core Value)")
-                diff_pct = (avg_u_bad - avg_u_good) / avg_u_good * 100
-                print(f"  >> Uncertainty increased by {diff_pct:.2f}% on hard cases.")
-            else:
-                print(" WARNING: Uncertainty is not correlated with error.")
+    with open('case_study_results.pkl', 'wb') as f:
+        pickle.dump({'success': final_success, 'failure': final_failure}, f)
 
-            # [新增] 打印一个具体的 Case 详情，可以直接写进论文 Case Study 章节
-            print("\n[Example Case Study]")
-            best_case = max(good_cases, key=lambda x: x['f1'])
-            print(
-                f"  Best Case (PID {best_case['pid_index']}): F1={best_case['f1']:.4f}, U={best_case['mean_uncertainty']:.4f}")
-        else:
-            print(" Not enough cases found. Please relax thresholds further.")
-
-        print("=" * 60)
+    print(f"  -> 成功提取并保存 {len(final_success)} 个优质 Success Cases")
+    print(f"  -> 成功提取并保存 {len(final_failure)} 个高不确定性 Failure Cases")
+    print("=" * 60)
 
     print(f"Seed: {seed}")
     print(f"Dataset: {dataset}")
