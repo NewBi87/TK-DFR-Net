@@ -482,53 +482,60 @@ if __name__ == '__main__':
     #     print(" Evaluation failed: Not enough valid cases.")
     #
     # print("=" * 60)
-    # --------- 阶段 12: 精确 Case Study 筛选与轻量化导出 ---------
-    # --------- 阶段 12: 精确 Case Study 筛选与轻量化导出 ---------
-    print(f"\n>>> [Phase 12] Exporting Case Studies for Qualitative Analysis...")
+    # --------- 阶段 12: 精确 Case Study 筛选与轻量化导出 (迷惑性案例版) ---------
+    # --------- 阶段 12: 全量 Case Study 导出 (用于后续精确筛选与分布分析) ---------
+    print(f"\n>>> [Phase 12] Exporting All Test Cases for Qualitative Analysis...")
+
+    from sklearn.metrics import f1_score
+    import pickle
 
     model.eval()
-    success_candidates = []
-    failure_candidates = []
+    all_test_cases = []
 
     with torch.no_grad():
         for step in range(len(test_data)):
             code_x, visit_lens, divided, y, neighbors, pid_index = test_data[step]
+            # 获取模型输出
             output = model(code_x, divided, neighbors, visit_lens, pid_index, timeseries_data_test).squeeze()
 
-            # EDL 核心计算
-            evidence = torch.relu(output)
-            S = evidence + 2
+            # EDL 核心计算 (雙重證據 Softplus 版)
+            evidence_pos = torch.nn.functional.softplus(output)
+            evidence_neg = torch.nn.functional.softplus(-output)
+            S = evidence_pos + evidence_neg + 2
             uncertainty = 2 / S
-            probs = (evidence + 1) / S
+            probs = (evidence_pos + 1) / S
 
             y_np = y.cpu().numpy()
             u_np = uncertainty.cpu().numpy()
             probs_np = probs.cpu().numpy()
 
+            # 处理 Batch 中的每个样本
             for i in range(len(code_x)):
                 v_len = visit_lens[i]
                 if isinstance(v_len, torch.Tensor): v_len = v_len.item()
 
-                # 获取该患者真实的疾病索引
+                # 获取真实疾病索引 (Ground Truth)
                 true_idx = np.where(y_np[i] == 1)[0].tolist()
                 true_num = len(true_idx)
 
+                # 跳过无标签样本
                 if true_num == 0:
                     continue
 
-                # 【核心修复】：彻底废弃 best_thr，对齐 metrics.py 的 Top-K (K=true_num) 排序提取法
-                # 按照 EDL 输出概率从高到低排序，取最自信的前 true_num 个疾病作为预测结果
+                # 采用 Top-K 动态预测 (K = 真实疾病数)
                 sorted_idx = np.argsort(probs_np[i])[::-1]
                 pred_idx = sorted_idx[:true_num].tolist()
 
-                # 生成用于计算当前样本个体 F1 的二进制数组
+                # 计算个体 F1 分数
                 pred_bin = np.zeros_like(y_np[i])
                 pred_bin[pred_idx] = 1
-
-                # 此时算出的 p_f1 将完美符合全局日志的分布规律
                 p_f1 = f1_score(y_np[i], pred_bin, average='binary', zero_division=0)
-                mean_u = np.mean(u_np[i])
 
+                # [核心修正]：计算模型预测出的那几个核心项的平均不确定性
+                # 双重证据下，该值通常分布在 0.4 - 0.59 之间
+                mean_u = np.mean(u_np[i][pred_idx])
+
+                # 存储该样本所有必要信息
                 case_data = {
                     'pid': pid_index[i],
                     'visit_count': v_len,
@@ -540,28 +547,18 @@ if __name__ == '__main__':
                     'uncertainty_map': u_np[i]
                 }
 
-                # 筛选成功案例 (门槛：就诊>=2次，由于TopK法则提取更严格，F1>=0.30即可抓到极其精彩的病例)
-                if v_len >= 2 and p_f1 >= 0.30:
-                    success_candidates.append(case_data)
+                # 仅保留复诊患者 (就诊次数 >= 2)
+                if v_len >= 2:
+                    all_test_cases.append(case_data)
 
-                # 筛选失败拦截案例 (门槛：就诊>=2次，预测完全失准 F1=0，且不确定性>0.85)
-                elif v_len >= 2 and p_f1 < 0.05 and mean_u > 0.85:
-                    failure_candidates.append(case_data)
+    # 保存全量数据池
+    output_filename = 'case_study_results_all.pkl'
+    with open(output_filename, 'wb') as f:
+        # 为了保持与分析脚本兼容，包装在 success 键下或新增全量键
+        pickle.dump({'all_cases': all_test_cases}, f)
 
-    # 排序并截断 (各取 Top 50 保证轻量化)
-    success_candidates.sort(key=lambda x: x['f1'], reverse=True)
-    failure_candidates.sort(key=lambda x: x['uncertainty'], reverse=True)
-
-    final_success = success_candidates[:50]
-    final_failure = failure_candidates[:50]
-
-    import pickle
-
-    with open('case_study_results.pkl', 'wb') as f:
-        pickle.dump({'success': final_success, 'failure': final_failure}, f)
-
-    print(f"  -> 成功提取并保存 {len(final_success)} 个优质 Success Cases")
-    print(f"  -> 成功提取并保存 {len(final_failure)} 个高不确定性 Failure Cases")
+    print(f"  -> 成功导出 {len(all_test_cases)} 个测试样本至: {output_filename}")
+    print(f"  -> 注意：双重证据下 U 均值约在 [0.4, 0.6] 之间，请在分析脚本中据此调整筛选阈值。")
     print("=" * 60)
 
     print(f"Seed: {seed}")

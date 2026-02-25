@@ -379,30 +379,64 @@ class BinaryEDLLoss(nn.Module):
 
         return torch.mean(loss)
 
+    # def forward(self, logits, target):
+    #     """
+    #     [混合版 V2] MSE (EDL) + Focal Loss (Ranking)
+    #     """
+    #     # --- A. EDL 部分 (MSE) ---
+    #     evidence = torch.relu(logits)
+    #     alpha = evidence + 1
+    #     S = alpha + 1
+    #     prob = alpha / S
+    #
+    #     # MSE Loss
+    #     loss_mse = torch.mean((target - prob) ** 2 + prob * (1 - prob) / (S + 1))
+    #
+    #     # KL 散度
+    #     annealing_coef = min(1.0, self.epoch / self.annealing_step)
+    #     kl_penalty = self.kl_weight * annealing_coef * evidence * (1 - target)
+    #
+    #     loss_edl = loss_mse + torch.mean(kl_penalty)
+    #
+    #     # --- B. Ranking 部分 (Focal Loss) ---
+    #     # 专门针对 "硬负样本" 进行惩罚，优化 Top-K 排序
+    #     loss_focal = self.focal_loss(logits, target)
+    #
+    #     # --- C. 总损失 ---
+    #     loss = loss_edl + self.aux_weight * loss_focal
+    #
+    #     return loss
     def forward(self, logits, target):
         """
-        [混合版 V2] MSE (EDL) + Focal Loss (Ranking)
+        [修復版 V3] 雙重證據 (Dual Evidence) + MSE (EDL) + Focal Loss (Ranking)
         """
-        # --- A. EDL 部分 (MSE) ---
-        evidence = torch.relu(logits)
-        alpha = evidence + 1
-        S = alpha + 1
+        # --- A. EDL 部分 (雙重證據機制) ---
+        # 1. 分別獲取正向與負向證據 (使用 softplus 確保平滑且大於 0)
+        evidence_pos = torch.nn.functional.softplus(logits)
+        evidence_neg = torch.nn.functional.softplus(-logits)
+
+        # 2. 計算 Dirichlet/Beta 分布參數
+        alpha = evidence_pos + 1
+        beta = evidence_neg + 1
+        S = alpha + beta
+
+        # 3. 預測機率 (完美覆蓋 0~1)
         prob = alpha / S
 
-        # MSE Loss
+        # 4. MSE Loss (EDL 主任務損失)
         loss_mse = torch.mean((target - prob) ** 2 + prob * (1 - prob) / (S + 1))
 
-        # KL 散度
+        # 5. KL 散度 (同時懲罰對正負樣本的過度自信)
         annealing_coef = min(1.0, self.epoch / self.annealing_step)
-        kl_penalty = self.kl_weight * annealing_coef * evidence * (1 - target)
+        kl_penalty = self.kl_weight * annealing_coef * (evidence_pos * (1 - target) + evidence_neg * target)
 
         loss_edl = loss_mse + torch.mean(kl_penalty)
 
         # --- B. Ranking 部分 (Focal Loss) ---
-        # 专门针对 "硬负样本" 进行惩罚，优化 Top-K 排序
+        # 專門針對 "硬負樣本" 進行懲罰，優化 Top-K 排序
         loss_focal = self.focal_loss(logits, target)
 
-        # --- C. 总损失 ---
+        # --- C. 總損失 ---
         loss = loss_edl + self.aux_weight * loss_focal
 
         return loss

@@ -113,13 +113,26 @@ def evaluate_codes(model, dataset, loss_fn, output_size, timeseries_data, histor
     preds = []
     patient_id = []
 
+    #------
+    # ... 原有初始化代碼 ...
+    all_attributions = []
+    #-----
+
     # [关键] 只要还在评估阶段，不需要计算梯度，节省显存
     with torch.no_grad():
         for step in range(len(dataset)):
             code_x, visit_lens, divided, y, neighbors, pids = dataset[step]
 
             # 1. 获取模型输出 (Logits)
-            logits = model(code_x, divided, neighbors, visit_lens, pids, timeseries_data)
+            # logits = model(code_x, divided, neighbors, visit_lens, pids, timeseries_data)
+
+            # 調用模型時，僅在 save_data=True 時開啟歸因返回
+            if save_data:
+                logits, attributions = model(code_x, divided, neighbors, visit_lens, pids, timeseries_data,
+                                             return_attribution=True)
+                all_attributions.extend(attributions)
+            else:
+                logits = model(code_x, divided, neighbors, visit_lens, pids, timeseries_data)
 
             # 2. 计算损失 (Loss函数内部会处理Logits)
             loss = loss_fn(logits, y)
@@ -155,6 +168,12 @@ def evaluate_codes(model, dataset, loss_fn, output_size, timeseries_data, histor
             % (avg_loss, f1_score, prec[0], prec[1], prec[2], prec[3], recall[0], recall[1], recall[2], recall[3]))
 
     if save_data:
+        import pickle
+        with open('feature_attribution_matrix.pkl', 'wb') as f:
+            pickle.dump(all_attributions, f)
+        print("\n    [System] 歸因矩陣已成功儲存至 feature_attribution_matrix.pkl，共包含 %d 名患者數據" % len(
+            all_attributions))
+
         patient_id = np.concatenate(patient_id)
         actual_labels = [np.where(row == 1)[0].tolist() for row in labels]
 
@@ -164,6 +183,7 @@ def evaluate_codes(model, dataset, loss_fn, output_size, timeseries_data, histor
             pickle.dump(actual_labels, f)
 
     subgroup_analysis_by_visits(dataset, labels, preds)
+
     return avg_loss, f1_score
 
 

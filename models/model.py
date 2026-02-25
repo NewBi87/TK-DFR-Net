@@ -49,11 +49,49 @@ class Model(nn.Module):
         self.classifier = Classifier(hidden_size, output_size, dropout_rate, activation)
         self.device = device
 
-    def forward(self, code_x, divided, neighbors, lens, pid_index, data):
+    # def forward(self, code_x, divided, neighbors, lens, pid_index, data):
+    #     embeddings = self.embedding_layer()
+    #     c_embeddings, n_embeddings, u_embeddings = embeddings
+    #     output = []
+    #     #-----新添加-----
+    #
+    #     for code_x_i, divided_i, neighbor_i, len_i, pid_index_i in zip(code_x, divided, neighbors, lens, pid_index):
+    #         no_embeddings_i_prev = None
+    #         output_i = []
+    #         h_t = None
+    #         patinet_tensor = torch.tensor(data[pid_index_i]).to(self.device)
+    #
+    #         for t, (c_it, d_it, n_it, len_it) in enumerate(zip(code_x_i, divided_i, neighbor_i, range(len_i))):
+    #             # [关键修改] 显式传入两个图给 GraphLayer
+    #             co_embeddings, no_embeddings = self.graph_layer(
+    #                 code_x=c_it,
+    #                 neighbor=n_it,
+    #                 c_embeddings=c_embeddings,
+    #                 n_embeddings=n_embeddings,
+    #                 adj_stat=self.adj_stat,
+    #                 adj_ont=self.adj_ont
+    #             )
+    #
+    #             patient_data = patinet_tensor[len_it]
+    #             similarity_matrix = self.patient_feature_layer(patient_data, co_embeddings)
+    #             output_it, h_t = self.transition_layer(t, co_embeddings, d_it, no_embeddings_i_prev, u_embeddings,
+    #                                                    similarity_matrix, h_t)
+    #             no_embeddings_i_prev = no_embeddings
+    #             output_i.append(output_it)
+    #
+    #         output_i = self.attention(torch.vstack(output_i))
+    #         output.append(output_i)
+    #
+    #     output = torch.vstack(output)
+    #     output = self.classifier(output)
+    #     return output
+    def forward(self, code_x, divided, neighbors, lens, pid_index, data, return_attribution=False):
         embeddings = self.embedding_layer()
         c_embeddings, n_embeddings, u_embeddings = embeddings
         output = []
-        #-----新添加-----
+
+        # 用於儲存相似度矩陣
+        attribution_list = []
 
         for code_x_i, divided_i, neighbor_i, len_i, pid_index_i in zip(code_x, divided, neighbors, lens, pid_index):
             no_embeddings_i_prev = None
@@ -61,19 +99,25 @@ class Model(nn.Module):
             h_t = None
             patinet_tensor = torch.tensor(data[pid_index_i]).to(self.device)
 
+            # 單個患者的歷史相似度記錄
+            patient_attributions = []
+
             for t, (c_it, d_it, n_it, len_it) in enumerate(zip(code_x_i, divided_i, neighbor_i, range(len_i))):
-                # [关键修改] 显式传入两个图给 GraphLayer
                 co_embeddings, no_embeddings = self.graph_layer(
-                    code_x=c_it,
-                    neighbor=n_it,
-                    c_embeddings=c_embeddings,
-                    n_embeddings=n_embeddings,
-                    adj_stat=self.adj_stat,
-                    adj_ont=self.adj_ont
+                    code_x=c_it, neighbor=n_it,
+                    c_embeddings=c_embeddings, n_embeddings=n_embeddings,
+                    adj_stat=self.adj_stat, adj_ont=self.adj_ont
                 )
 
                 patient_data = patinet_tensor[len_it]
+
+                # 計算疾病-特徵相似度矩陣
                 similarity_matrix = self.patient_feature_layer(patient_data, co_embeddings)
+
+                # 如果開啟歸因，則記錄（移至 CPU 以節省顯存）
+                if return_attribution:
+                    patient_attributions.append(similarity_matrix.detach().cpu().numpy())
+
                 output_it, h_t = self.transition_layer(t, co_embeddings, d_it, no_embeddings_i_prev, u_embeddings,
                                                        similarity_matrix, h_t)
                 no_embeddings_i_prev = no_embeddings
@@ -82,6 +126,13 @@ class Model(nn.Module):
             output_i = self.attention(torch.vstack(output_i))
             output.append(output_i)
 
+            if return_attribution:
+                attribution_list.append(patient_attributions)
+
         output = torch.vstack(output)
         output = self.classifier(output)
+
+        # 根據標誌位返回
+        if return_attribution:
+            return output, attribution_list
         return output
